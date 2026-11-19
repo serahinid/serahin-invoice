@@ -633,9 +633,18 @@ html,body{margin:0;padding:0;background:#F4F1EC}
 .lsmsg{font-size:12.5px;color:#9FE3B5;margin:10px 0 0;min-height:1em}.lsmsg.bad{color:#FFB4A8}
 .lsinstall{margin-top:10px;width:100%;border:0;background:#fff;color:#17171B;font:inherit;font-weight:800;font-size:13.5px;padding:11px;border-radius:12px;cursor:pointer}
 .bbsync{display:flex;align-items:center;margin-left:auto;margin-right:10px}
+.syncinit{position:fixed;inset:0;z-index:9999;background:#17171B;display:flex;align-items:center;justify-content:center;padding:24px;color:#fff;font-family:'Plus Jakarta Sans',system-ui,sans-serif}
+.syncinit[hidden]{display:none}
+.sibox{text-align:center;max-width:300px}.sibox b{display:block;font-size:20px;margin:16px 0 6px}.sibox p{margin:0;color:rgba(255,255,255,.7);font-size:14px;line-height:1.5}
+.sispin{width:34px;height:34px;margin:0 auto;border-radius:50%;border:3px solid rgba(255,255,255,.15);border-top-color:#C9A86B;animation:sispin .8s linear infinite}
+@keyframes sispin{to{transform:rotate(360deg)}}
+.syncwarn{position:fixed;left:12px;right:12px;bottom:14px;z-index:9998;max-width:560px;margin:0 auto;background:#7C2D12;color:#fff;font-size:13px;line-height:1.45;padding:12px 14px;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.3);cursor:pointer;font-family:'Plus Jakarta Sans',system-ui,sans-serif}
+.syncwarn[hidden]{display:none}
 </style>
 </head>
 <body>
+<div id="syncInit" class="syncinit" hidden><div class="sibox"><div class="sispin"></div><b>Serahin.id Invoice</b><p id="syncInitTx">Mengambil data dari Google Sheet…</p></div></div>
+<div id="syncWarn" class="syncwarn" hidden></div>
 <div class="landing" id="landing">
   <div class="glow g1"></div><div class="glow g2"></div>
   <div class="lin">
@@ -663,14 +672,7 @@ html,body{margin:0;padding:0;background:#F4F1EC}
       </button>
     </div>
     <div class="lsync">
-      <div class="lsrow"><span class="sdot off" id="lsDot"></span><span class="lstx" id="lsText">Belum terhubung ke Google Sheet</span><button type="button" class="lsbtn" id="lsToggle">Koneksi Google</button></div>
-      <div class="lsform" id="lsForm" hidden>
-        <label>URL Web app Apps Script</label><input type="url" id="gUrl" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off">
-        <label>Kode akses</label><input type="password" id="gKey" placeholder="kode rahasia di Code.gs" autocomplete="off">
-        <div class="lsacts"><button type="button" class="lsmain" id="gSave">Simpan & tes koneksi</button><button type="button" class="lsbtn" id="gSync">Sinkron sekarang</button></div>
-        <div class="lsacts"><label class="lsbtn lsfile">Impor data awal (.json)<input type="file" id="gImport" accept=".json,application/json" hidden></label><button type="button" class="lsbtn" id="gExport">Unduh cadangan</button></div>
-        <p class="lsmsg" id="lsMsg"></p>
-      </div>
+      <div class="lsrow"><span class="sdot off" id="lsDot"></span><span class="lstx" id="lsText">Menyambungkan…</span><button type="button" class="lsbtn" id="gExport" title="Unduh salinan semua data (.json)">Cadangan</button></div>
       <button type="button" class="lsinstall" id="lInstall" hidden>＋ Pasang di layar utama</button>
     </div>
     <div class="lfoot"><span>Serahin.id Invoice</span><span id="lDate"></span></div>
@@ -1104,13 +1106,16 @@ html,body{margin:0;padding:0;background:#F4F1EC}
 
 
 </div>
+<script src="config.js"></script>
 <script>
 /* ================= Serahin Sync: data lokal (offline) + Google Sheet & Drive ================= */
 const SYNC = (function(){
-  const CFG_KEY = "serahin-sync-v1";
-  let conf = {url:"", key:"", lastPull:0, lastSync:0};
-  try{ conf = Object.assign(conf, JSON.parse(localStorage.getItem(CFG_KEY)||"{}")); }catch(e){}
-  const saveConf = () => { try{ localStorage.setItem(CFG_KEY, JSON.stringify(conf)); }catch(e){} };
+  // alamat server & kode akses diatur SEKALI di config.js (berlaku untuk semua perangkat)
+  const C = window.SERAHIN_CONFIG || {};
+  const STATE_KEY = "serahin-sync-state-v2";
+  let conf = {url: String(C.url||"").trim(), key: String(C.key||"").trim(), lastPull:0, lastSync:0};
+  try{ const st = JSON.parse(localStorage.getItem(STATE_KEY)||"{}"); if(st.url === conf.url){ conf.lastPull = st.lastPull||0; conf.lastSync = st.lastSync||0; } }catch(e){}
+  const saveConf = () => { try{ localStorage.setItem(STATE_KEY, JSON.stringify({url: conf.url, lastPull: conf.lastPull, lastSync: conf.lastSync})); }catch(e){} };
   const clone = o => o === undefined ? undefined : JSON.parse(JSON.stringify(o));
 
   /* ---- IndexedDB ---- */
@@ -1129,12 +1134,15 @@ const SYNC = (function(){
   const mem = new Map();          // path -> {path, data, updatedAt, deleted, dirty}
   const uploads = new Map();      // tmp -> {tmp, b64, mime, name, brand, date, del}
   const listeners = new Set();
-  let ready, readyDone = false;
+  let ready, readyDone = false, initial = false;
   ready = (async()=>{
     idb = await openIdb();
     (await idbAll("docs")).forEach(r=>mem.set(r.path, r));
     (await idbAll("uploads")).forEach(u=>uploads.set(u.tmp, u));
-    readyDone = true; emit(); kick(300);
+    // perangkat baru: tunggu data dari Sheet dulu sebelum aplikasi dipakai (mencegah data ganda / nomor bentrok)
+    initial = configured() && !conf.lastPull && ![...mem.values()].some(r=>!r.deleted);
+    meta.fromCache = initial;
+    readyDone = true; emit(); kick(0);
   })();
 
   /* ---- snapshot ---- */
@@ -1164,9 +1172,10 @@ const SYNC = (function(){
   function write(path, data, deleted){
     const prev = mem.get(path);
     // dokumen yang baru dibuat di perangkat ini tidak boleh menimpa data yang sudah ada di Sheet
-    const create = !deleted && (!prev || (prev.create && prev.dirty));
-    const r = {path, data: deleted ? null : clone(data), updatedAt: Date.now(), deleted: !!deleted, dirty: true, create};
-    mem.set(path, r); idbPut("docs", r); emit(); kick(1200); status();
+    const create = !deleted && (!prev || (prev.create && prev.dirty) || (prev.deleted && !prev.srv));
+    const r = {path, data: deleted ? null : clone(data), updatedAt: Math.max(Date.now(), (prev && prev.updatedAt || 0) + 1), deleted: !!deleted, dirty: true, create,
+      base: prev ? prev.base : undefined, srv: prev ? prev.srv : 0};
+    mem.set(path, r); idbPut("docs", r); emit(); kick(700); status();
     return Promise.resolve();
   }
   function query(path, order, lim){
@@ -1190,18 +1199,19 @@ const SYNC = (function(){
   const db = {collection: p => query(p), doc: p => docRef(p)};
 
   /* ---- server ---- */
-  const configured = () => !!(conf.url && conf.key);
+  const configured = () => /^https:\/\/script\.google(usercontent)?\.com\//.test(conf.url) && !!conf.key;
   async function call(payload){
     const res = await fetch(conf.url, {method:"POST", headers:{"Content-Type":"text/plain;charset=utf-8"}, body: JSON.stringify(Object.assign({key: conf.key}, payload)), redirect:"follow"});
     const j = await res.json();
     if(!j.ok) throw new Error(j.error || "gagal");
     return j;
   }
-  let busy = false, timer = null, lastErr = "";
+  let busy = false, timer = null, lastErr = "", again = false;
   function kick(ms){ clearTimeout(timer); timer = setTimeout(sync, ms==null ? 0 : ms); }
   async function sync(){
-    if(busy || !readyDone || !configured() || !navigator.onLine){ status(); return; }
-    busy = true; status();
+    if(busy){ again = true; return; }
+    if(!readyDone || !configured() || !navigator.onLine){ status(); return; }
+    busy = true; again = false; status();
     try{
       // 1. upload PDF yang menunggu
       for(const u of [...uploads.values()]){
@@ -1214,9 +1224,10 @@ const SYNC = (function(){
       const dirty = [...mem.values()].filter(r=>r.dirty);
       for(let i = 0; i < dirty.length; i += 80){
         const part = dirty.slice(i, i+80);
-        const res = await call({action:"push", docs: part.map(r=>({path:r.path, data:r.data, deleted:r.deleted, updatedAt:r.updatedAt, create: !!r.create}))});
+        const res = await call({action:"push", docs: part.map(packDoc)});
         const skipped = new Set(res.skipped || []);
-        part.forEach(r=>{ const cur = mem.get(r.path); if(cur && cur.updatedAt === r.updatedAt){ cur.dirty = false; cur.create = false; if(skipped.has(r.path)) cur.updatedAt = 0; idbPut("docs", cur); } });
+        if(res.conflicts && res.conflicts.length) window.dispatchEvent(new CustomEvent("serahin-conflict", {detail: res.conflicts}));
+        part.forEach(r=>{ const cur = mem.get(r.path); if(cur && cur.updatedAt === r.updatedAt){ cur.dirty = false; cur.create = false; if(skipped.has(r.path)){ cur.updatedAt = 0; cur.srv = 0; } else cur.base = clone(cur.data); idbPut("docs", cur); } });
         if(skipped.size) conf.lastPull = 0;     // ambil versi dari Sheet untuk dokumen yang ditolak
       }
       // 3. ambil perubahan dari Sheet
@@ -1224,16 +1235,41 @@ const SYNC = (function(){
       let changed = false;
       (j.docs||[]).forEach(d=>{
         const cur = mem.get(d.path);
-        if(cur && cur.dirty && cur.updatedAt > d.updatedAt) return;
-        if(cur && !cur.dirty && cur.updatedAt === d.updatedAt && !!cur.deleted === !!d.deleted) return;
-        const r = {path:d.path, data:d.deleted ? null : d.data, updatedAt:d.updatedAt, deleted:!!d.deleted, dirty:false, create:false};
+        if(cur && cur.dirty && cur.updatedAt > d.updatedAt) return;          // perubahan lokal lebih baru, kirim nanti
+        if(cur && !cur.dirty && cur.srv && cur.srv === d.serverTs) return;
+        const data = d.deleted ? null : d.data;
+        const r = {path:d.path, data, base: clone(data), updatedAt:d.updatedAt, srv: d.serverTs || 0, deleted:!!d.deleted, dirty:false, create:false};
         mem.set(d.path, r); idbPut("docs", r); changed = true;
       });
       conf.lastPull = j.now || conf.lastPull; conf.lastSync = Date.now(); saveConf(); lastErr = "";
+      if(initial){ initial = false; meta.fromCache = false; changed = true; }
       if(changed) emit();
     }catch(e){ lastErr = String(e && e.message || e); }
     busy = false; status();
-    clearTimeout(timer); timer = setTimeout(sync, 30000);
+    const dirtyLeft = [...mem.values()].some(r=>r.dirty) || uploads.size;
+    clearTimeout(timer); timer = setTimeout(sync, again || (dirtyLeft && !lastErr) ? 400 : lastErr ? 10000 : document.visibilityState === "visible" ? 15000 : 60000);
+    const w = waiters.splice(0); w.forEach(f=>f());
+  }
+  // kirim hanya kolom yang berubah, supaya edit dari 2 perangkat tidak saling menimpa
+  function packDoc(r){
+    const o = {path:r.path, deleted:r.deleted, updatedAt:r.updatedAt, create: !!r.create};
+    const isObj = v => v && typeof v === "object" && !Array.isArray(v);
+    if(!r.deleted && !r.create && isObj(r.base) && isObj(r.data)){
+      const patch = {}, unset = [];
+      Object.keys(r.data).forEach(k=>{ if(JSON.stringify(r.data[k]) !== JSON.stringify(r.base[k])) patch[k] = r.data[k]; });
+      Object.keys(r.base).forEach(k=>{ if(!(k in r.data)) unset.push(k); });
+      o.patch = patch; o.unset = unset;
+    }else o.data = r.data;
+    return o;
+  }
+  const waiters = [];
+  // tunggu sinkron selesai (dipakai sebelum mengirim invoice baru)
+  function fresh(maxMs){
+    if(!configured() || !navigator.onLine) return Promise.resolve();
+    return new Promise(res=>{
+      const t = setTimeout(res, maxMs || 8000), done = ()=>{ clearTimeout(t); res(); };
+      if(busy) waiters.push(()=>{ waiters.push(done); kick(0); }); else { waiters.push(done); kick(0); }
+    });
   }
   window.addEventListener("online", ()=>kick(200));
   window.addEventListener("offline", ()=>status());
@@ -1243,7 +1279,7 @@ const SYNC = (function(){
   const subs = new Set();
   function info(){
     const pending = [...mem.values()].filter(r=>r.dirty).length + uploads.size;
-    return {configured: configured(), online: navigator.onLine, busy, pending, lastSync: conf.lastSync, error: lastErr, url: conf.url, key: conf.key};
+    return {configured: configured(), online: navigator.onLine, busy, pending, lastSync: conf.lastSync, error: lastErr, initial};
   }
   function status(){ const i = info(); subs.forEach(f=>{ try{ f(i); }catch(e){} }); }
 
@@ -1274,21 +1310,13 @@ const SYNC = (function(){
   };
 
   /* ---- impor / ekspor ---- */
-  async function importDocs(docs){
-    await ready; let n = 0;
-    docs.forEach(d=>{ if(d && d.path && d.data){ write(d.path, d.data, false); n++; } });
-    kick(500); return n;
-  }
   async function exportAll(){
     await ready;
     return {exportedAt: new Date().toISOString(), docs: [...mem.values()].filter(r=>!r.deleted).map(r=>({path:r.path, data:r.data}))};
   }
 
   return {
-    db, assetsFor, downloads, ready, sync: ()=>kick(0), info, onStatus: f=>{ subs.add(f); f(info()); },
-    setConfig(url, key){ const changed = url !== conf.url; conf.url = url.trim(); conf.key = key.trim(); if(changed) conf.lastPull = 0; saveConf(); status(); },
-    async test(){ return call({action:"ping"}); },
-    importDocs, exportAll,
+    db, assetsFor, downloads, ready, sync: ()=>kick(0), fresh, info, onStatus: f=>{ subs.add(f); f(info()); }, exportAll,
   };
 })();
 window.claude = {
@@ -1300,6 +1328,7 @@ window.claude = {
     return null;
   }
 };
+window.SYNC_FRESH = ms => SYNC.fresh(ms);
 function PDFURL(id){ return id && !String(id).startsWith("pending:") ? "https://drive.google.com/file/d/" + id + "/view" : ""; }
 
 const SRDB = d => d ? { collection: n => d.collection("sr_" + n), doc: p => d.doc("sr_" + p) } : null;
@@ -2060,10 +2089,20 @@ async function send(mode){
   if(busy) return;
   if(TAB==="keu") return;
   const U = TAB==="umum";
-  const d = U ? getDataU() : getData();
+  let d = U ? getDataU() : getData();
   if(U ? !validateU(d) : !validate(d)) return;
   if(usedByOther(d.num, U ? "umum" : "skripsi")){ toast(`Nomor ${d.num} sudah dipakai invoice ${U ? "Skripsi & COC" : "Produk Cetak"}. Ganti nomornya dulu.`, 3600); return; }
   busy = true; $("sendBtn").disabled = $("dlBtn").disabled = true;
+  if(window.SYNC_FRESH && d.num === cfg.nextNum){
+    await SYNC_FRESH(); await new Promise(r=>setTimeout(r, 80));
+    if(history.some(h=>h.num===d.num)){
+      const was = d.num; let nn = cfg.nextNum; while(history.some(h=>h.num===nn)) nn = nextNumber(nn);
+      cfg.nextNum = nn; saveCfg();
+      if(U){ invU.num = nn; $("numU").value = nn; saveU(); } else { inv.num = nn; $("num").value = nn; saveDraft(); }
+      d = U ? getDataU() : getData(); update();
+      toast(`Nomor ${was} sudah dipakai perangkat lain → invoice ini memakai ${nn}`, 4500);
+    }
+  }
   try{
     const blob = buildPdf(U ? renderUmum : renderDoc).output("blob");
     const who = d.to || (U ? "" : d.rows.map(r=>r.name).filter(Boolean).slice(0,3).join(", ") + (d.rows.length > 3 ? ` +${d.rows.length-3}` : "")) || d.title;
@@ -2970,7 +3009,7 @@ async function initKeuDb(db){
     const remote = snap.docs.filter(x=>x.exists).map(x=>clone(x.data()));
     const ids = new Set(remote.map(r=>r.id));
     if(!sync.done) sync.done = {};
-    if(!sync.done[kind]){ keu[key].filter(x=>!ids.has(x.id)).forEach(x=>{ kdb[kind].doc(x.id).set(x).catch(()=>{}); remote.push(x); }); sync.done[kind] = true; }
+    if(!sync.done[kind]){ keu[key].filter(x=>false && !ids.has(x.id)).forEach(x=>{ kdb[kind].doc(x.id).set(x).catch(()=>{}); remote.push(x); }); sync.done[kind] = true; }
     const typing = document.activeElement && document.activeElement.closest && document.activeElement.closest("#tab-keu .mpanel, #matForm");
     keu[key] = remote; saveKeuLocal(); if(TAB==="keu" && !typing) renderKeu();
   }, ()=>{});
@@ -2993,7 +3032,7 @@ document.fonts.load("800 12px SLB").then(()=>Promise.all(["400","600","700"].map
     cdb.onSnapshot(snap=>{
       if(snap.metadata.fromCache) return;
       const remote = snap.docs.filter(x=>x.exists).map(x=>clone(x.data()));
-      if(cFirst){ const ids = new Set(remote.map(r=>r.id)); contacts.filter(c=>!ids.has(c.id)).forEach(c=>{ cdb.doc(c.id).set(c).catch(()=>{}); remote.push(c); }); cFirst = false; }
+      if(cFirst){ const ids = new Set(remote.map(r=>r.id)); contacts.filter(c=>false && !ids.has(c.id)).forEach(c=>{ cdb.doc(c.id).set(c).catch(()=>{}); remote.push(c); }); cFirst = false; }
       contacts = remote; saveContactsLocal(); renderContactList();
     }, ()=>{});
     hdb = db.collection("history");
@@ -3001,7 +3040,7 @@ document.fonts.load("800 12px SLB").then(()=>Promise.all(["400","600","700"].map
       if(snap.metadata.fromCache) return;
       const remote = snap.docs.filter(x=>x.exists).map(x=>clone(x.data()));
       const ids = new Set(remote.map(r=>r.num));
-      history.filter(h=>!ids.has(h.num)).forEach(h=>{ hdb.doc(cid(h.num)).set(h).catch(()=>{}); remote.push(h); });
+      history.filter(h=>false && !ids.has(h.num)).forEach(h=>{ hdb.doc(cid(h.num)).set(h).catch(()=>{}); remote.push(h); });
       history = remote.sort((a,b)=>(b.createdAt||0)-(a.createdAt||0)); saveLocalHistory(); renderHistory(); syncDraftNums(); if(TAB==="keu") renderKeu();
     }, ()=>{ hdb = null; });
     const sref = db.doc("config/settings");
@@ -3327,8 +3366,17 @@ function validate(d){
 let busy = false;
 async function send(mode){
   if(busy) return;
-  const d = getData(); if(!validate(d)) return;
+  let d = getData(); if(!validate(d)) return;
   busy = true; $("sendBtn").disabled = $("dlBtn").disabled = true;
+  if(window.SYNC_FRESH && d.num === cfg.nextNum){
+    await SYNC_FRESH(); await new Promise(r=>setTimeout(r, 80));
+    if(history.some(h=>h.num===d.num)){
+      const was = d.num; let nn = cfg.nextNum; while(history.some(h=>h.num===nn)) nn = nextNumber(nn);
+      cfg.nextNum = nn; saveCfg(); $("num").value = nn;
+      d = getData(); update();
+      toast(`Nomor ${was} sudah dipakai perangkat lain → invoice ini memakai ${nn}`, 4500);
+    }
+  }
   try{
     const blob = buildPdf().output("blob");
     const filename = `${safe(d.num)} - ${safe(d.name)}.pdf`;
@@ -3447,7 +3495,7 @@ loadLocalContacts(); renderList();
         first = false;
         // pindahkan kontak lama yang hanya ada di HP ini ke penyimpanan online
         const ids = new Set(remote.map(r=>r.id));
-        contacts.filter(c=>!ids.has(c.id)).forEach(c=>{ cdb.doc(c.id).set({name:c.name, addr:c.addr||"", updatedAt:c.updatedAt||Date.now()}).catch(()=>{}); remote.push(c); });
+        contacts.filter(c=>false && !ids.has(c.id)).forEach(c=>{ cdb.doc(c.id).set({name:c.name, addr:c.addr||"", updatedAt:c.updatedAt||Date.now()}).catch(()=>{}); remote.push(c); });
       }
       if(!first || !snap.metadata.fromCache){ contacts = remote; saveLocalContacts(); renderList(); }
       $("cstatus").textContent = "Kontak tersinkron & otomatis tersimpan saat invoice dikirim.";
@@ -3703,7 +3751,7 @@ function initKeuDb(db){
     kdb[kind].onSnapshot(snap=>{
       if(snap.metadata.fromCache) return;
       const remote = snap.docs.filter(x=>x.exists).map(x=>clone(x.data()));
-      if(first){ const ids = new Set(remote.map(r=>r.id)); keu[key].filter(x=>!ids.has(x.id)).forEach(x=>{ kdb[kind].doc(x.id).set(x).catch(()=>{}); remote.push(x); }); first = false; }
+      if(first){ const ids = new Set(remote.map(r=>r.id)); keu[key].filter(x=>false && !ids.has(x.id)).forEach(x=>{ kdb[kind].doc(x.id).set(x).catch(()=>{}); remote.push(x); }); first = false; }
       keu[key] = remote; saveKeuLocal(); if(TAB==="keu") renderKeu();
     }, ()=>{});
   });
@@ -3725,7 +3773,7 @@ buildProducts(); update();
       const remote = snap.docs.filter(x=>x.exists).map(x=>JSON.parse(JSON.stringify(x.data())));
       const ids = new Set(remote.map(r=>r.num));
       // pindahkan riwayat lokal yang belum ada di database
-      history.filter(h=>!ids.has(h.num)).forEach(h=>{ hdb.doc(cid(h.num)).set(h).catch(()=>{}); remote.push(h); });
+      history.filter(h=>false && !ids.has(h.num)).forEach(h=>{ hdb.doc(cid(h.num)).set(h).catch(()=>{}); remote.push(h); });
       history = remote.sort((a,b)=>(b.createdAt||0)-(a.createdAt||0)); saveLocalHistory(); renderHistory(); if(TAB==="keu") renderKeu();
     }, ()=>{ hdb = null; });
     // pengaturan & nomor invoice
@@ -3927,48 +3975,39 @@ const ANA = (function(){
   document.getElementById("lDate").textContent = new Date().toLocaleDateString("id-ID", {weekday:"long", day:"numeric", month:"long", year:"numeric"});
   show(brand);
 })();
-/* ================= PWA: koneksi Google, status sinkron, pasang aplikasi ================= */
+/* ================= PWA: status sinkron otomatis, pasang aplikasi ================= */
 (function(){
   const $ = id => document.getElementById(id);
   const ago = t => { if(!t) return "belum pernah"; const s = Math.round((Date.now() - t) / 1000); if(s < 60) return "baru saja"; const m = Math.round(s/60); if(m < 60) return m + " menit lalu"; const h = Math.round(m/60); return h < 24 ? h + " jam lalu" : new Date(t).toLocaleDateString("id-ID", {day:"numeric", month:"short"}); };
   function paint(i){
     let cls = "ok", txt;
-    if(!i.configured){ cls = "off"; txt = "Belum terhubung ke Google Sheet"; }
-    else if(!i.online){ cls = "warn"; txt = "Offline" + (i.pending ? ` · ${i.pending} perubahan menunggu` : " · data tetap tersimpan di perangkat"); }
-    else if(i.error){ cls = "err"; txt = "Sinkron gagal: " + i.error; }
-    else if(i.busy){ cls = "busy"; txt = "Menyinkronkan…"; }
-    else txt = "Tersinkron ke Google Sheet · " + ago(i.lastSync) + (i.pending ? ` · ${i.pending} menunggu` : "");
+    if(!i.configured){ cls = "err"; txt = "Server belum diatur (isi config.js)"; }
+    else if(!i.online){ cls = "warn"; txt = "Offline" + (i.pending ? ` · ${i.pending} perubahan dikirim otomatis saat online` : " · data tetap aman di perangkat"); }
+    else if(i.error){ cls = "err"; txt = "Belum tersambung, mencoba lagi otomatis… (" + i.error + ")"; }
+    else if(i.busy || i.pending){ cls = "busy"; txt = "Menyimpan ke Google Sheet…"; }
+    else txt = "Tersimpan otomatis di Google Sheet · " + ago(i.lastSync);
     ["lsDot","bbDot"].forEach(id=>{ const e = $(id); if(e) e.className = "sdot " + cls; });
     if($("lsText")) $("lsText").textContent = txt;
     if($("bbSync")) $("bbSync").title = txt;
+    // perangkat baru: tahan sampai data dari Sheet masuk
+    const ov = $("syncInit");
+    if(ov){
+      ov.hidden = !i.initial;
+      if(i.initial) $("syncInitTx").textContent = !i.online ? "Perangkat ini butuh internet sekali untuk mengambil data pertama kali." : i.error ? "Belum bisa tersambung, mencoba lagi… (" + i.error + ")" : "Mengambil data dari Google Sheet…";
+    }
   }
   SYNC.onStatus(paint);
-  setInterval(()=>paint(SYNC.info()), 30000);
+  setInterval(()=>paint(SYNC.info()), 20000);
 
-  const i0 = SYNC.info();
-  $("gUrl").value = i0.url || ""; $("gKey").value = i0.key || "";
-  $("lsToggle").onclick = ()=>{ $("lsForm").hidden = !$("lsForm").hidden; };
-  if(!i0.configured) $("lsForm").hidden = false;
-  const msg = (t, bad) => { $("lsMsg").textContent = t; $("lsMsg").className = "lsmsg" + (bad ? " bad" : ""); };
-  $("gSave").onclick = async ()=>{
-    const url = $("gUrl").value.trim(), key = $("gKey").value.trim();
-    if(!/^https:\/\/script\.google(usercontent)?\.com\//.test(url)){ msg("URL harus URL Web app Apps Script (https://script.google.com/…/exec)", true); return; }
-    if(!key){ msg("Isi kode akses", true); return; }
-    SYNC.setConfig(url, key); msg("Mengetes koneksi…");
-    try{ const r = await SYNC.test(); msg(`Tersambung ke “${r.sheet}”. Data mulai disinkronkan.`); SYNC.sync(); setTimeout(()=>{ $("lsForm").hidden = true; }, 1800); }
-    catch(e){ msg("Gagal tersambung: " + (e.message || e) + ". Cek URL, kode akses, dan akses Web app = Anyone.", true); }
-  };
-  $("gSync").onclick = ()=>{ SYNC.sync(); msg("Sinkron dimulai…"); };
-  $("gImport").onchange = async e=>{
-    const f = e.target.files && e.target.files[0]; if(!f) return;
-    try{
-      const j = JSON.parse(await f.text());
-      const n = await SYNC.importDocs(j.docs || []);
-      msg(`${n} data diimpor. Muat ulang halaman supaya semua tampilan memakai data baru.`);
-      setTimeout(()=>location.reload(), 2500);
-    }catch(err){ msg("File tidak bisa dibaca: " + (err.message || err), true); }
-    e.target.value = "";
-  };
+  // invoice bernomor sama dibuat bersamaan di 2 perangkat
+  window.addEventListener("serahin-conflict", e=>{
+    const n = (e.detail || []).map(p=>p.split("/").pop()).join(", ");
+    const b = $("syncWarn"); if(!b) return;
+    b.textContent = `Nomor ${n} juga baru dibuat di perangkat lain. Versi perangkat ini disimpan di Sheet (tab “Konflik nomor”) — cek & kirim ulang dengan nomor baru bila perlu.`;
+    b.hidden = false; clearTimeout(b._t); b._t = setTimeout(()=>{ b.hidden = true; }, 15000);
+  });
+  if($("syncWarn")) $("syncWarn").onclick = ()=>{ $("syncWarn").hidden = true; };
+
   $("gExport").onclick = async ()=>{
     const j = await SYNC.exportAll();
     const blob = new Blob([JSON.stringify(j)], {type:"application/json"});
@@ -3983,7 +4022,7 @@ const ANA = (function(){
   if(!standalone && ios){ $("lInstall").hidden = false; }
   $("lInstall").onclick = async ()=>{
     if(deferred){ deferred.prompt(); try{ await deferred.userChoice; }catch(e){} deferred = null; $("lInstall").hidden = true; }
-    else if(ios) msg("Di iPhone: ketuk tombol Bagikan (kotak dengan panah) di Safari → “Tambahkan ke Layar Utama”.");
+    else if(ios) alert("Di iPhone: ketuk tombol Bagikan (kotak dengan panah) di Safari → “Tambahkan ke Layar Utama”.");
   };
 
   if("serviceWorker" in navigator) window.addEventListener("load", ()=>navigator.serviceWorker.register("sw.js").catch(()=>{}));
