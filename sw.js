@@ -1,5 +1,5 @@
 /* Serahin.id Invoice — service worker (offline) */
-const VERSION = "serahin-v2";
+const VERSION = "serahin-v3";
 const SHELL = ["./", "./index.html", "./config.js", "./manifest.webmanifest", "./icons/icon-192.png", "./icons/icon-512.png"];
 const CDN = /^https:\/\/(cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|fonts\.googleapis\.com|fonts\.gstatic\.com)\//;
 

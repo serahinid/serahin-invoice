@@ -632,6 +632,7 @@ html,body{margin:0;padding:0;background:#F4F1EC}
 .lsfile{display:inline-flex !important;margin:0 !important;color:#fff !important;font-size:12.5px !important}
 .lsmsg{font-size:12.5px;color:#9FE3B5;margin:10px 0 0;min-height:1em}.lsmsg.bad{color:#FFB4A8}
 .lsinstall{margin-top:10px;width:100%;border:0;background:#fff;color:#17171B;font:inherit;font-weight:800;font-size:13.5px;padding:11px;border-radius:12px;cursor:pointer}
+.lsfix{margin-top:10px;justify-content:flex-end}.lsfix .lsbtn{opacity:.75;font-weight:600}
 .bbsync{display:flex;align-items:center;margin-left:auto;margin-right:10px}
 .syncinit{position:fixed;inset:0;z-index:9999;background:#17171B;display:flex;align-items:center;justify-content:center;padding:24px;color:#fff;font-family:'Plus Jakarta Sans',system-ui,sans-serif}
 .syncinit[hidden]{display:none}
@@ -673,6 +674,7 @@ html,body{margin:0;padding:0;background:#F4F1EC}
     </div>
     <div class="lsync">
       <div class="lsrow"><span class="sdot off" id="lsDot"></span><span class="lstx" id="lsText">Menyambungkan…</span><button type="button" class="lsbtn" id="gExport" title="Unduh salinan semua data (.json)">Cadangan</button></div>
+      <div class="lsrow lsfix"><button type="button" class="lsbtn" id="gForce" title="Sekali pakai, kalau data antar-perangkat tidak sama">Jadikan HP ini acuan</button></div>
       <button type="button" class="lsinstall" id="lInstall" hidden>＋ Pasang di layar utama</button>
     </div>
     <div class="lfoot"><span>Serahin.id Invoice</span><span id="lDate"></span></div>
@@ -1206,30 +1208,42 @@ const SYNC = (function(){
     if(!j.ok) throw new Error(j.error || "gagal");
     return j;
   }
-  let busy = false, timer = null, lastErr = "", again = false;
+  let busy = false, timer = null, lastErr = "", upErr = "", again = false;
+  async function pushDirty(){
+    const dirty = [...mem.values()].filter(r=>r.dirty);
+    for(let i = 0; i < dirty.length; i += 40){
+      const part = dirty.slice(i, i+40);
+      const res = await call({action:"push", docs: part.map(packDoc)});
+      const skipped = new Set(res.skipped || []);
+      if(res.conflicts && res.conflicts.length) window.dispatchEvent(new CustomEvent("serahin-conflict", {detail: res.conflicts}));
+      part.forEach(r=>{ const cur = mem.get(r.path); if(cur && cur.updatedAt === r.updatedAt){ cur.dirty = false; cur.create = false; if(skipped.has(r.path)){ cur.updatedAt = 0; cur.srv = 0; } else cur.base = clone(cur.data); idbPut("docs", cur); } });
+      if(skipped.size) conf.lastPull = 0;     // ambil versi dari Sheet untuk dokumen yang ditolak
+    }
+  }
   function kick(ms){ clearTimeout(timer); timer = setTimeout(sync, ms==null ? 0 : ms); }
   async function sync(){
     if(busy){ again = true; return; }
     if(!readyDone || !configured() || !navigator.onLine){ status(); return; }
     busy = true; again = false; status();
     try{
-      // 1. upload PDF yang menunggu
+      // 1. kirim data dulu — invoice, pembayaran, pengeluaran tidak boleh tertahan oleh PDF
+      await pushDirty();
+      // 2. upload PDF satu per satu; kalau gagal, dicoba lagi nanti tanpa menahan data lain
+      upErr = "";
       for(const u of [...uploads.values()]){
-        if(u.del){ try{ await call({action:"trash", id:u.del}); }catch(e){} uploads.delete(u.tmp); idbDel("uploads", u.tmp); continue; }
-        const j = await call({action:"upload", name:u.name, brand:u.brand, date:u.date, mime:u.mime, b64:u.b64});
-        uploads.delete(u.tmp); idbDel("uploads", u.tmp);
-        mem.forEach(r=>{ if(!r.deleted && r.data && r.data.pdf === u.tmp){ const d = clone(r.data); d.pdf = j.id; write(r.path, d, false); } });
+        if(u.next && u.next > Date.now()) continue;
+        try{
+          if(u.del){ await call({action:"trash", id:u.del}); uploads.delete(u.tmp); idbDel("uploads", u.tmp); continue; }
+          const j = await call({action:"upload", name:u.name, brand:u.brand, date:u.date, mime:u.mime, b64:u.b64});
+          uploads.delete(u.tmp); idbDel("uploads", u.tmp);
+          mem.forEach(r=>{ if(!r.deleted && r.data && r.data.pdf === u.tmp){ const d = clone(r.data); d.pdf = j.id; write(r.path, d, false); } });
+        }catch(e){
+          u.tries = (u.tries||0) + 1; u.next = Date.now() + Math.min(600000, 15000 * u.tries); idbPut("uploads", u);
+          upErr = "PDF " + (u.name || "") + " belum masuk Drive: " + String(e && e.message || e);
+          if(u.del && u.tries > 5){ uploads.delete(u.tmp); idbDel("uploads", u.tmp); }
+        }
       }
-      // 2. kirim perubahan
-      const dirty = [...mem.values()].filter(r=>r.dirty);
-      for(let i = 0; i < dirty.length; i += 80){
-        const part = dirty.slice(i, i+80);
-        const res = await call({action:"push", docs: part.map(packDoc)});
-        const skipped = new Set(res.skipped || []);
-        if(res.conflicts && res.conflicts.length) window.dispatchEvent(new CustomEvent("serahin-conflict", {detail: res.conflicts}));
-        part.forEach(r=>{ const cur = mem.get(r.path); if(cur && cur.updatedAt === r.updatedAt){ cur.dirty = false; cur.create = false; if(skipped.has(r.path)){ cur.updatedAt = 0; cur.srv = 0; } else cur.base = clone(cur.data); idbPut("docs", cur); } });
-        if(skipped.size) conf.lastPull = 0;     // ambil versi dari Sheet untuk dokumen yang ditolak
-      }
+      await pushDirty();
       // 3. ambil perubahan dari Sheet
       const j = await call({action:"pull", since: conf.lastPull||0});
       let changed = false;
@@ -1246,7 +1260,7 @@ const SYNC = (function(){
       if(changed) emit();
     }catch(e){ lastErr = String(e && e.message || e); }
     busy = false; status();
-    const dirtyLeft = [...mem.values()].some(r=>r.dirty) || uploads.size;
+    const dirtyLeft = [...mem.values()].some(r=>r.dirty);
     clearTimeout(timer); timer = setTimeout(sync, again || (dirtyLeft && !lastErr) ? 400 : lastErr ? 10000 : document.visibilityState === "visible" ? 15000 : 60000);
     const w = waiters.splice(0); w.forEach(f=>f());
   }
@@ -1278,8 +1292,8 @@ const SYNC = (function(){
   /* ---- status ---- */
   const subs = new Set();
   function info(){
-    const pending = [...mem.values()].filter(r=>r.dirty).length + uploads.size;
-    return {configured: configured(), online: navigator.onLine, busy, pending, lastSync: conf.lastSync, error: lastErr, initial};
+    const pending = [...mem.values()].filter(r=>r.dirty).length;
+    return {configured: configured(), online: navigator.onLine, busy, pending, lastSync: conf.lastSync, error: lastErr, upErr, uploads: uploads.size, initial};
   }
   function status(){ const i = info(); subs.forEach(f=>{ try{ f(i); }catch(e){} }); }
 
@@ -1310,13 +1324,20 @@ const SYNC = (function(){
   };
 
   /* ---- impor / ekspor ---- */
+  // kirim ulang SEMUA data di perangkat ini dan menangkan atas versi di Sheet
+  async function forceAll(){
+    await ready; const now = Date.now(); let n = 0;
+    mem.forEach(r=>{ if(r.path.indexOf("konflik/") === 0) return; r.dirty = true; r.create = false; r.base = undefined; r.updatedAt = now + 60000; idbPut("docs", r); n++; });
+    uploads.forEach(u=>{ u.next = 0; u.tries = 0; });
+    status(); await fresh(60000); return n;
+  }
   async function exportAll(){
     await ready;
     return {exportedAt: new Date().toISOString(), docs: [...mem.values()].filter(r=>!r.deleted).map(r=>({path:r.path, data:r.data}))};
   }
 
   return {
-    db, assetsFor, downloads, ready, sync: ()=>kick(0), fresh, info, onStatus: f=>{ subs.add(f); f(info()); }, exportAll,
+    db, assetsFor, downloads, ready, sync: ()=>kick(0), fresh, info, onStatus: f=>{ subs.add(f); f(info()); }, exportAll, forceAll,
   };
 })();
 window.claude = {
@@ -3041,7 +3062,15 @@ document.fonts.load("800 12px SLB").then(()=>Promise.all(["400","600","700"].map
       const remote = snap.docs.filter(x=>x.exists).map(x=>clone(x.data()));
       const ids = new Set(remote.map(r=>r.num));
       history.filter(h=>false && !ids.has(h.num)).forEach(h=>{ hdb.doc(cid(h.num)).set(h).catch(()=>{}); remote.push(h); });
-      history = remote.sort((a,b)=>(b.createdAt||0)-(a.createdAt||0)); saveLocalHistory(); renderHistory(); syncDraftNums(); if(TAB==="keu") renderKeu();
+      history = remote.sort((a,b)=>(b.createdAt||0)-(a.createdAt||0)); saveLocalHistory();
+      { const top = history.reduce((m,h)=>numPart(h.num) > numPart(m) ? h.num : m, "");
+        if(top && numPart(top) >= numPart(cfg.nextNum)){
+          cfg.nextNum = nextNumber(top); saveCfg(); pushSettings();
+          if(!history.some(h=>h.num===inv.num) && numPart(inv.num) < numPart(cfg.nextNum) && document.activeElement !== $("num")){ inv.num = cfg.nextNum; $("num").value = inv.num; saveDraft(); }
+          if(typeof invU!=="undefined" && invU && !history.some(h=>h.num===invU.num) && numPart(invU.num) < numPart(cfg.nextNum) && document.activeElement !== $("numU")){ invU.num = cfg.nextNum; $("numU").value = invU.num; saveU(); }
+          update();
+        } }
+      renderHistory(); syncDraftNums(); if(TAB==="keu") renderKeu();
     }, ()=>{ hdb = null; });
     const sref = db.doc("config/settings");
     sref.onSnapshot(snap=>{
@@ -3774,7 +3803,14 @@ buildProducts(); update();
       const ids = new Set(remote.map(r=>r.num));
       // pindahkan riwayat lokal yang belum ada di database
       history.filter(h=>false && !ids.has(h.num)).forEach(h=>{ hdb.doc(cid(h.num)).set(h).catch(()=>{}); remote.push(h); });
-      history = remote.sort((a,b)=>(b.createdAt||0)-(a.createdAt||0)); saveLocalHistory(); renderHistory(); if(TAB==="keu") renderKeu();
+      history = remote.sort((a,b)=>(b.createdAt||0)-(a.createdAt||0)); saveLocalHistory();
+      { const top = history.reduce((m,h)=>numPart(h.num) > numPart(m) ? h.num : m, "");
+        if(top && numPart(top) >= numPart(cfg.nextNum)){
+          cfg.nextNum = nextNumber(top); saveCfg(); pushSettings();
+          if(document.activeElement !== $("num") && !history.some(h=>h.num===$("num").value) && numPart($("num").value) < numPart(cfg.nextNum)) $("num").value = cfg.nextNum;
+          update();
+        } }
+      renderHistory(); if(TAB==="keu") renderKeu();
     }, ()=>{ hdb = null; });
     // pengaturan & nomor invoice
     const sref = db.doc("config/settings");
@@ -3985,7 +4021,8 @@ const ANA = (function(){
     else if(!i.online){ cls = "warn"; txt = "Offline" + (i.pending ? ` · ${i.pending} perubahan dikirim otomatis saat online` : " · data tetap aman di perangkat"); }
     else if(i.error){ cls = "err"; txt = "Belum tersambung, mencoba lagi otomatis… (" + i.error + ")"; }
     else if(i.busy || i.pending){ cls = "busy"; txt = "Menyimpan ke Google Sheet…"; }
-    else txt = "Tersimpan otomatis di Google Sheet · " + ago(i.lastSync);
+    else if(i.upErr){ cls = "warn"; txt = "Data tersimpan di Sheet · " + i.upErr + " (dicoba lagi otomatis)"; }
+    else txt = "Tersimpan otomatis di Google Sheet · " + ago(i.lastSync) + (i.uploads ? ` · ${i.uploads} PDF diunggah…` : "");
     ["lsDot","bbDot"].forEach(id=>{ const e = $(id); if(e) e.className = "sdot " + cls; });
     if($("lsText")) $("lsText").textContent = txt;
     if($("bbSync")) $("bbSync").title = txt;
@@ -4012,6 +4049,16 @@ const ANA = (function(){
     const j = await SYNC.exportAll();
     const blob = new Blob([JSON.stringify(j)], {type:"application/json"});
     SYNC.downloads.save({filename: `Cadangan Serahin.id Invoice ${new Date().toISOString().slice(0,10)}.json`, data: blob});
+  };
+
+  // perbaikan sekali pakai: data di perangkat ini menimpa Sheet
+  $("gForce").onclick = async ()=>{
+    if(!confirm("Jadikan data di perangkat ini sebagai acuan?\n\nSemua invoice, pembayaran, pengeluaran, dan pengaturan di perangkat ini akan dikirim ulang dan menimpa versi di Google Sheet. Perangkat lain ikut menyesuaikan.")) return;
+    const b = $("gForce"); b.disabled = true; b.textContent = "Mengirim…";
+    const n = await SYNC.forceAll();
+    const i = SYNC.info();
+    b.disabled = false; b.textContent = "Jadikan HP ini acuan";
+    alert(i.error ? "Belum berhasil: " + i.error + "\nCoba lagi saat internet stabil." : n + " data dari perangkat ini sudah jadi acuan di Google Sheet.");
   };
 
   // pasang ke layar utama
